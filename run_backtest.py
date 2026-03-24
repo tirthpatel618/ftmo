@@ -117,7 +117,7 @@ def run_simulation(strategy_key: str, num_sims: int = 50):
     return sim_result
 
 
-def run_optimize(strategy_key: str, max_combos: int = 200):
+def run_optimize(strategy_key: str, max_combos: int = 200, max_workers: int = 4):
     from engine.optimizer import optimize_strategy, walk_forward_validate, print_top_results
 
     strat = STRATEGIES[strategy_key]
@@ -134,7 +134,7 @@ def run_optimize(strategy_key: str, max_combos: int = 200):
         pairs=strat["pairs"],
         param_grid=grid,
         max_combos=max_combos,
-        max_workers=4,
+        max_workers=max_workers,
     )
 
     if not results:
@@ -239,7 +239,8 @@ Strategies: london, bb_squeeze, fvg, ensemble
             run_simulation(strategy_key, num_sims)
         else:
             max_combos = int(sys.argv[3]) if len(sys.argv) > 3 else 300
-            run_optimize(strategy_key, max_combos)
+            max_workers = int(sys.argv[4]) if len(sys.argv) > 4 else 4
+            run_optimize(strategy_key, max_combos, max_workers)
     else:
         print(usage)
 
