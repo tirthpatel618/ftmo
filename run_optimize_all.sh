@@ -18,13 +18,17 @@ echo ""
 
 mkdir -p results
 
+TOTAL_START=$SECONDS
+
 for STRATEGY in london bb_squeeze fvg ensemble; do
     echo "=========================================="
     echo "Optimizing: $STRATEGY"
     echo "=========================================="
-    python3 run_backtest.py optimize "$STRATEGY" "$MAX_COMBOS" 2>&1 | tee "results/optimize_${STRATEGY}.log"
+    T=$SECONDS
+    python3 run_backtest.py optimize "$STRATEGY" "$MAX_COMBOS" "$MAX_WORKERS" 2>&1 | tee "results/optimize_${STRATEGY}.log"
+    echo "  [$STRATEGY done in $(( SECONDS - T ))s | total $(( SECONDS - TOTAL_START ))s]"
     echo ""
 done
 
-echo "=== All optimizations complete ==="
+echo "=== All optimizations complete in $(( SECONDS - TOTAL_START ))s ==="
 echo "Results saved in results/"
