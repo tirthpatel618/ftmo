@@ -1,9 +1,6 @@
 """NY Session Momentum Strategy.
 
 Trades momentum continuation during the London/NY overlap.
-- Entry: Break of London session high/low after 12:00 UTC
-- Confirmed by RSI momentum filter
-- Pairs: EUR/USD, GBP/USD, USD/CAD
 """
 
 import backtrader as bt
@@ -31,13 +28,9 @@ class NYMomentum(FTMOBase):
 
     def __init__(self):
         self._init_ftmo()
-
         self.london_highs = {}
         self.london_lows = {}
         self.traded_today = {}
-        self.orders = {}
-        self.stop_orders = {}
-        self.tp_orders = {}
         self.current_date = {}
         self.rsi = {}
         self.atr = {}
@@ -47,15 +40,13 @@ class NYMomentum(FTMOBase):
             self.london_highs[name] = 0
             self.london_lows[name] = float("inf")
             self.traded_today[name] = False
-            self.orders[name] = None
-            self.stop_orders[name] = None
-            self.tp_orders[name] = None
             self.current_date[name] = None
             self.rsi[name] = bt.indicators.RSI(d.close, period=self.p.rsi_period)
             self.atr[name] = bt.indicators.ATR(d, period=14)
 
     def next(self):
-        if not self._check_ftmo_limits():
+        self._update_day()
+        if self.p.use_circuit_breaker and not self._check_ftmo_limits():
             self._close_all_positions()
             return
         for d in self.datas:
@@ -71,14 +62,13 @@ class NYMomentum(FTMOBase):
         today = dt.date()
         pip_size = self._get_pip_size(name)
 
-        # New day — reset
         if today != self.current_date.get(name):
             self.london_highs[name] = 0
             self.london_lows[name] = float("inf")
             self.traded_today[name] = False
             self.current_date[name] = today
 
-        # Build London session range (07:00-12:00 UTC)
+        # Build London session range
         if self.p.london_start <= hour < self.p.ny_entry_start:
             self.london_highs[name] = max(self.london_highs[name], d.high[0])
             self.london_lows[name] = min(self.london_lows[name], d.low[0])
@@ -88,9 +78,7 @@ class NYMomentum(FTMOBase):
         if self.p.ny_entry_start <= hour < self.p.ny_entry_end:
             if self.traded_today[name]:
                 return
-            if self.getposition(d).size != 0:
-                return
-            if self.orders.get(name):
+            if not self._can_trade(d):
                 return
 
             london_high = self.london_highs[name]
@@ -106,69 +94,22 @@ class NYMomentum(FTMOBase):
             if atr_val <= 0:
                 return
 
-            # Long: break above London high + RSI confirms momentum
+            # Long
             if price > london_high and rsi > self.p.rsi_long_threshold:
                 sl_distance = min(atr_val * 1.5, self.p.max_sl_pips * pip_size)
                 sl = price - sl_distance
                 tp = price + (sl_distance * self.p.risk_reward)
+                self.traded_today[name] = True
                 self._enter_trade(d, name, True, price, sl, tp, sl_distance)
 
-            # Short: break below London low + RSI confirms weakness
+            # Short
             elif price < london_low and rsi < self.p.rsi_short_threshold:
                 sl_distance = min(atr_val * 1.5, self.p.max_sl_pips * pip_size)
                 sl = price + sl_distance
                 tp = price - (sl_distance * self.p.risk_reward)
+                self.traded_today[name] = True
                 self._enter_trade(d, name, False, price, sl, tp, sl_distance)
 
         # Session close
         if hour >= self.p.session_close:
-            if self.getposition(d).size != 0:
-                self.close(data=d)
-                if self.stop_orders.get(name):
-                    self.cancel(self.stop_orders[name])
-                if self.tp_orders.get(name):
-                    self.cancel(self.tp_orders[name])
-
-    def _enter_trade(self, d, name, is_long, price, sl, tp, sl_distance):
-        account_value = self.broker.getvalue()
-        risk_amount = account_value * self.p.risk_pct
-        size = risk_amount / sl_distance
-
-        if size <= 0:
-            return
-
-        self.traded_today[name] = True
-
-        if is_long:
-            self.orders[name] = self.buy(data=d, size=size)
-            self.stop_orders[name] = self.sell(
-                data=d, size=size, exectype=bt.Order.Stop, price=sl
-            )
-            self.tp_orders[name] = self.sell(
-                data=d, size=size, exectype=bt.Order.Limit, price=tp
-            )
-        else:
-            self.orders[name] = self.sell(data=d, size=size)
-            self.stop_orders[name] = self.buy(
-                data=d, size=size, exectype=bt.Order.Stop, price=sl
-            )
-            self.tp_orders[name] = self.buy(
-                data=d, size=size, exectype=bt.Order.Limit, price=tp
-            )
-
-    def notify_order(self, order):
-        if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
-            for name in self.orders:
-                if self.orders[name] == order:
-                    self.orders[name] = None
-                    break
-
-    def notify_trade(self, trade):
-        if trade.isclosed:
-            name = trade.data._name
-            if self.stop_orders.get(name):
-                self.cancel(self.stop_orders[name])
-                self.stop_orders[name] = None
-            if self.tp_orders.get(name):
-                self.cancel(self.tp_orders[name])
-                self.tp_orders[name] = None
+            self._close_position(d)

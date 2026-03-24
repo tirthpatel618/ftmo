@@ -13,8 +13,13 @@ import config
 from engine.ftmo_rules import FTMOAnalyzer, TradeStats
 
 
-def load_data(pair: str, timeframe_minutes: int = None) -> bt.feeds.PandasData:
-    """Load CSV data into a Backtrader data feed."""
+def load_data(
+    pair: str,
+    timeframe_minutes: int = None,
+    start_date: str = None,
+    end_date: str = None,
+) -> bt.feeds.PandasData:
+    """Load CSV data into a Backtrader data feed, optionally filtered by date range."""
     if timeframe_minutes is None:
         timeframe_minutes = config.TIMEFRAME_MINUTES
 
@@ -27,7 +32,15 @@ def load_data(pair: str, timeframe_minutes: int = None) -> bt.feeds.PandasData:
     df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
     df.columns = [c.lower() for c in df.columns]
 
-    # Ensure required columns exist
+    # Filter by date range if provided
+    if start_date:
+        df = df[df.index >= start_date]
+    if end_date:
+        df = df[df.index <= end_date]
+
+    if len(df) == 0:
+        raise ValueError(f"No data for {pair} in range {start_date} to {end_date}")
+
     for col in ["open", "high", "low", "close"]:
         if col not in df.columns:
             raise ValueError(f"Missing column '{col}' in {csv_path}")
@@ -37,7 +50,7 @@ def load_data(pair: str, timeframe_minutes: int = None) -> bt.feeds.PandasData:
 
     data = bt.feeds.PandasData(
         dataname=df,
-        datetime=None,  # index is datetime
+        datetime=None,
         open="open",
         high="high",
         low="low",
@@ -59,11 +72,7 @@ def run_backtest(
     profit_target_pct: float = None,
     strategy_params: dict = None,
 ) -> dict:
-    """
-    Run a backtest for a strategy across one or more pairs.
-
-    Returns dict with FTMO analysis, trade stats, and final equity.
-    """
+    """Run a backtest for a strategy across one or more pairs."""
     if initial_balance is None:
         initial_balance = config.INITIAL_BALANCE
     if profit_target_pct is None:
@@ -71,33 +80,31 @@ def run_backtest(
 
     cerebro = bt.Cerebro()
 
-    # Add strategy with optional params
     if strategy_params:
         cerebro.addstrategy(strategy_class, **strategy_params)
     else:
         cerebro.addstrategy(strategy_class)
 
-    # Load data for each pair
+    # Load data for each pair (with date filtering)
     for pair in pairs:
         try:
-            data = load_data(pair)
+            data = load_data(pair, start_date=start_date, end_date=end_date)
             data._name = pair
             cerebro.adddata(data, name=pair)
-        except FileNotFoundError as e:
+        except (FileNotFoundError, ValueError) as e:
             print(f"Warning: {e}")
             continue
 
     if not cerebro.datas:
         return {"error": "No data loaded"}
 
-    # Broker settings
+    # Broker: 1:100 leverage (FTMO standard), spread as commission
     cerebro.broker.setcash(initial_balance)
-    # Forex broker: 1:100 leverage (FTMO standard), spread as commission
     cerebro.broker.setcommission(
-        commission=config.COMMISSION_PIPS * 0.0001,  # 2 pips spread cost
+        commission=config.COMMISSION_PIPS * 0.0001,
         commtype=bt.CommInfoBase.COMM_FIXED,
         stocklike=False,
-        leverage=100.0,  # FTMO offers 1:100 forex leverage
+        leverage=100.0,
     )
 
     # Analyzers
@@ -111,7 +118,6 @@ def run_backtest(
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name="sharpe", riskfreerate=0.0)
     cerebro.addanalyzer(bt.analyzers.Returns, _name="returns")
 
-    # Run
     results = cerebro.run()
     strat = results[0]
 
@@ -134,12 +140,7 @@ def simulate_ftmo_challenges(
     num_simulations: int = 50,
     strategy_params: dict = None,
 ) -> dict:
-    """
-    Simulate multiple rolling FTMO challenges across the historical data.
-
-    Slides a 30-day window across the data and checks if the strategy
-    would have passed each window.
-    """
+    """Simulate multiple rolling FTMO challenges across historical data."""
     if challenge_days is None:
         challenge_days = config.CHALLENGE_DAYS
 
@@ -156,9 +157,12 @@ def simulate_ftmo_challenges(
     if total_range < challenge_days:
         return {"error": "Not enough data for simulation"}
 
-    # Generate evenly spaced start dates
     step = max(1, (total_range - challenge_days) // num_simulations)
     results = []
+
+    # Enable circuit breakers for FTMO simulations
+    sim_params = dict(strategy_params or {})
+    sim_params["use_circuit_breaker"] = True
 
     print(f"\nSimulating {num_simulations} FTMO challenges ({challenge_days} days each)...")
 
@@ -169,13 +173,12 @@ def simulate_ftmo_challenges(
         if window_end > end:
             break
 
-        # Filter data to window and run backtest
         result = run_backtest(
             strategy_class=strategy_class,
             pairs=pairs,
             start_date=window_start.strftime("%Y-%m-%d"),
             end_date=window_end.strftime("%Y-%m-%d"),
-            strategy_params=strategy_params,
+            strategy_params=sim_params,
         )
 
         if "error" in result:

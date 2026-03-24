@@ -1,10 +1,9 @@
-"""CLI entry point for running backtests."""
+"""CLI entry point for running backtests and optimization."""
 
 import sys
 import os
 from pathlib import Path
 
-# Ensure project root is in path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import config
@@ -13,6 +12,10 @@ from engine.reporter import print_backtest_report, print_simulation_report, cons
 from strategies.london_breakout import LondonBreakout
 from strategies.mean_reversion import MeanReversion
 from strategies.ny_momentum import NYMomentum
+from strategies.bb_squeeze import BBSqueeze
+from strategies.fvg import FVG
+from strategies.rsi_divergence import RSIDivergence
+from strategies.mtf_london_breakout import MTFLondonBreakout
 
 STRATEGIES = {
     "london": {
@@ -30,11 +33,43 @@ STRATEGIES = {
         "pairs": config.NY_MOMENTUM_PAIRS,
         "name": "NY Session Momentum",
     },
+    "bb_squeeze": {
+        "class": BBSqueeze,
+        "pairs": config.BB_SQUEEZE_PAIRS,
+        "name": "Bollinger Squeeze Breakout",
+    },
+    "fvg": {
+        "class": FVG,
+        "pairs": config.FVG_PAIRS,
+        "name": "ICT Fair Value Gap",
+    },
+    "rsi_divergence": {
+        "class": RSIDivergence,
+        "pairs": config.RSI_DIV_PAIRS,
+        "name": "RSI Divergence",
+    },
+    "mtf_london": {
+        "class": MTFLondonBreakout,
+        "pairs": config.MTF_LONDON_PAIRS,
+        "name": "MTF London Breakout",
+    },
+}
+
+# Parameter grids for optimization
+PARAM_GRIDS = {
+    "london": {
+        "risk_reward": [1.5, 2.0, 2.5, 3.0],
+        "min_range_pips": [15, 20, 30, 40],
+        "max_range_pips": [60, 80, 100],
+        "max_sl_pips": [30, 40, 50],
+        "london_entry_end": [9, 10, 11],
+        "risk_pct": [0.01, 0.015, 0.02, 0.03],
+        "day_filter": [[1, 2, 3], [0, 1, 2, 3], [0, 1, 2, 3, 4]],
+    },
 }
 
 
 def run_single(strategy_key: str):
-    """Run a single strategy backtest on full data."""
     strat = STRATEGIES[strategy_key]
     console.print(f"\n[bold]Running {strat['name']}...[/bold]\n")
 
@@ -52,7 +87,6 @@ def run_single(strategy_key: str):
 
 
 def run_simulation(strategy_key: str, num_sims: int = 50):
-    """Simulate multiple FTMO challenges for a strategy."""
     strat = STRATEGIES[strategy_key]
     console.print(f"\n[bold]Simulating FTMO challenges for {strat['name']}...[/bold]\n")
 
@@ -70,8 +104,54 @@ def run_simulation(strategy_key: str, num_sims: int = 50):
     return sim_result
 
 
+def run_optimize(strategy_key: str, max_combos: int = 300):
+    from engine.optimizer import optimize_strategy, walk_forward_validate, print_top_results
+
+    strat = STRATEGIES[strategy_key]
+    grid = PARAM_GRIDS.get(strategy_key)
+
+    if not grid:
+        console.print(f"[red]No parameter grid defined for '{strategy_key}'[/red]")
+        return
+
+    console.print(f"\n[bold]Optimizing {strat['name']}...[/bold]\n")
+
+    results = optimize_strategy(
+        strategy_class=strat["class"],
+        pairs=strat["pairs"],
+        param_grid=grid,
+        max_combos=max_combos,
+        max_workers=4,
+    )
+
+    if not results:
+        console.print("[red]No valid results from optimization[/red]")
+        return
+
+    print_top_results(results, n=15)
+
+    # Walk-forward validate top 3
+    console.print(f"\n[bold]Walk-forward validating top 3...[/bold]")
+    for i, r in enumerate(results[:3]):
+        console.print(f"\n[cyan]#{i+1} params: {r['params']}[/cyan]")
+        wf = walk_forward_validate(
+            strategy_class=strat["class"],
+            pairs=strat["pairs"],
+            params=r["params"],
+        )
+        if "error" not in wf:
+            oof = wf["overfitting_ratio"]
+            status = "[green]PASS[/green]" if oof > 0.5 else "[red]OVERFIT[/red]"
+            console.print(f"  IS expectancy: ${wf['avg_is_expectancy']:.2f} | "
+                          f"OOS expectancy: ${wf['avg_oos_expectancy']:.2f} | "
+                          f"Ratio: {oof:.2f} {status}")
+            console.print(f"  IS profit: {wf['avg_is_profit_pct']:+.1f}% | "
+                          f"OOS profit: {wf['avg_oos_profit_pct']:+.1f}%")
+
+    return results
+
+
 def run_all():
-    """Run all strategies and compare."""
     console.print("\n[bold]=" * 60)
     console.print("[bold]FTMO STRATEGY BACKTESTER — ALL STRATEGIES[/bold]")
     console.print("[bold]=" * 60)
@@ -82,7 +162,6 @@ def run_all():
         if result:
             results[key] = result
 
-    # Comparison table
     if results:
         from rich.table import Table
         table = Table(title="Strategy Comparison", show_lines=True)
@@ -113,12 +192,13 @@ def run_all():
 
 def main():
     usage = """
-Usage: python run_backtest.py <command> [strategy]
+Usage: python run_backtest.py <command> [strategy] [options]
 
 Commands:
-  single <strategy>     Run full backtest for one strategy
-  simulate <strategy>   Simulate 50 FTMO challenges
-  all                   Run all strategies and compare
+  single <strategy>              Run full backtest for one strategy
+  simulate <strategy> [n]        Simulate n FTMO challenges (default 50)
+  optimize <strategy> [n]        Optimize params (n = max combos, default 300)
+  all                            Run all strategies and compare
 
 Strategies: london, mean_reversion, ny_momentum
     """
@@ -131,7 +211,7 @@ Strategies: london, mean_reversion, ny_momentum
 
     if command == "all":
         run_all()
-    elif command in ("single", "simulate"):
+    elif command in ("single", "simulate", "optimize"):
         if len(sys.argv) < 3:
             print(f"Please specify a strategy: {', '.join(STRATEGIES.keys())}")
             return
@@ -141,9 +221,12 @@ Strategies: london, mean_reversion, ny_momentum
             return
         if command == "single":
             run_single(strategy_key)
-        else:
+        elif command == "simulate":
             num_sims = int(sys.argv[3]) if len(sys.argv) > 3 else 50
             run_simulation(strategy_key, num_sims)
+        else:
+            max_combos = int(sys.argv[3]) if len(sys.argv) > 3 else 300
+            run_optimize(strategy_key, max_combos)
     else:
         print(usage)
 

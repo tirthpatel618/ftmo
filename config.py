@@ -52,6 +52,18 @@ NY_RSI_LONG_THRESHOLD = 55   # loosened from 60
 NY_RSI_SHORT_THRESHOLD = 45  # loosened from 40
 NY_RISK_REWARD = 2.0
 
+# ── BB Squeeze Parameters ───────────────────────────────────
+BB_SQUEEZE_PAIRS = ["EURUSD", "GBPUSD", "GBPJPY", "EURJPY"]
+
+# ── FVG Parameters ──────────────────────────────────────────
+FVG_PAIRS = ["EURUSD", "GBPUSD", "GBPJPY", "EURJPY"]
+
+# ── RSI Divergence Parameters ───────────────────────────────
+RSI_DIV_PAIRS = ["EURCHF", "AUDNZD", "EURGBP", "EURUSD"]
+
+# ── MTF London Breakout Parameters ──────────────────────────
+MTF_LONDON_PAIRS = ["EURUSD", "GBPUSD", "GBPJPY", "EURJPY"]
+
 # ── Backtesting ──────────────────────────────────────────────
 COMMISSION_PIPS = 1.0      # FTMO provides tight spreads (~1 pip for majors)
 DATA_DIR = "data/raw"
