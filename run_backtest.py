@@ -66,6 +66,33 @@ PARAM_GRIDS = {
         "risk_pct": [0.01, 0.015, 0.02, 0.03],
         "day_filter": [[1, 2, 3], [0, 1, 2, 3], [0, 1, 2, 3, 4]],
     },
+    "bb_squeeze": {
+        "squeeze_min_bars": [3, 4, 6, 8],
+        "release_window": [3, 6, 10],
+        "risk_reward": [1.5, 2.0, 2.5, 3.0],
+        "max_sl_pips": [25, 35, 50],
+        "risk_pct": [0.01, 0.015, 0.02, 0.03],
+        "min_body_ratio": [0.3, 0.5, 0.7],
+        "kc_atr_mult": [1.0, 1.5, 2.0],
+    },
+    "fvg": {
+        "risk_reward": [1.5, 2.0, 2.5],
+        "min_impulse_atr_mult": [1.0, 1.3, 1.5, 2.0],
+        "max_fvg_age": [24, 48, 96],
+        "max_sl_pips": [25, 35, 50],
+        "risk_pct": [0.01, 0.015, 0.02, 0.03],
+        "ema_period": [30, 50, 100],
+        "min_gap_atr_ratio": [0.2, 0.3, 0.5],
+    },
+    "rsi_divergence": {
+        "rsi_extreme_low": [30, 35, 40],
+        "rsi_extreme_high": [60, 65, 70],
+        "swing_lookback": [2, 3, 5],
+        "max_swing_distance": [30, 50, 70],
+        "risk_reward": [1.5, 2.0, 2.5, 3.0],
+        "risk_pct": [0.01, 0.015, 0.02, 0.03],
+        "atr_sl_mult": [1.0, 1.5, 2.0],
+    },
 }
 
 

@@ -22,13 +22,15 @@ class BBSqueeze(FTMOBase):
         ("bb_std", 2.0),
         ("kc_period", 20),
         ("kc_atr_mult", 1.5),
-        ("squeeze_min_bars", 6),       # min bars in squeeze before trading
+        ("squeeze_min_bars", 4),        # min bars in squeeze before trading (was 6)
+        ("release_window", 6),          # bars after squeeze release to look for entry
         ("risk_reward", 2.0),
         ("risk_pct", config.RISK_PER_TRADE_PCT),
         ("max_sl_pips", 40),
         ("session_start", 7),           # London open
         ("session_end", 20),            # NY close
         ("atr_period", 14),
+        ("min_body_ratio", 0.5),        # breakout candle body must be >= 50% of range
     )
 
     def __init__(self):
@@ -37,7 +39,10 @@ class BBSqueeze(FTMOBase):
         self.kc_upper = {}
         self.kc_lower = {}
         self.atr = {}
+        self.ema = {}
         self.squeeze_count = {}
+        self.bars_since_release = {}    # how many bars since squeeze ended
+        self.last_squeeze_bars = {}     # how long the last squeeze lasted
         self.traded_today = {}
         self.current_date = {}
 
@@ -50,9 +55,12 @@ class BBSqueeze(FTMOBase):
             ema = bt.indicators.ExponentialMovingAverage(d.close, period=self.p.kc_period)
             atr = bt.indicators.ATR(d, period=self.p.atr_period)
             self.atr[name] = atr
+            self.ema[name] = ema
             self.kc_upper[name] = ema + atr * self.p.kc_atr_mult
             self.kc_lower[name] = ema - atr * self.p.kc_atr_mult
             self.squeeze_count[name] = 0
+            self.bars_since_release[name] = 999
+            self.last_squeeze_bars[name] = 0
             self.traded_today[name] = False
             self.current_date[name] = None
 
@@ -93,17 +101,28 @@ class BBSqueeze(FTMOBase):
 
         if in_squeeze:
             self.squeeze_count[name] += 1
-            return  # Don't trade during squeeze, wait for release
+            self.bars_since_release[name] = 999  # reset release counter
+            return  # Don't trade during squeeze
 
-        squeeze_bars = self.squeeze_count[name]
-        self.squeeze_count[name] = 0  # Reset on release
+        # Track squeeze release
+        if self.squeeze_count[name] > 0:
+            # Squeeze just ended this bar
+            self.last_squeeze_bars[name] = self.squeeze_count[name]
+            self.squeeze_count[name] = 0
+            self.bars_since_release[name] = 0
+        else:
+            self.bars_since_release[name] += 1
 
         # Only trade during active sessions
         if hour < self.p.session_start or hour >= self.p.session_end:
             return
 
-        # Need minimum squeeze duration
-        if squeeze_bars < self.p.squeeze_min_bars:
+        # Must have had a valid squeeze recently
+        if self.last_squeeze_bars[name] < self.p.squeeze_min_bars:
+            return
+
+        # Entry window: within N bars of squeeze release
+        if self.bars_since_release[name] > self.p.release_window:
             return
 
         if self.traded_today[name]:
@@ -112,17 +131,25 @@ class BBSqueeze(FTMOBase):
             return
 
         price = d.close[0]
+        candle_range = d.high[0] - d.low[0]
+        candle_body = abs(d.close[0] - d.open[0])
 
-        # Breakout above upper BB = long
-        if price > bb_up:
+        # Momentum confirmation: strong candle body
+        if candle_range > 0 and candle_body / candle_range < self.p.min_body_ratio:
+            return
+
+        ema_val = self.ema[name][0]
+
+        # Breakout above upper BB = long (with EMA trend confirmation)
+        if price > bb_up and price > ema_val:
             sl_distance = min(atr_val * 1.5, self.p.max_sl_pips * pip_size)
             sl = price - sl_distance
             tp = price + (sl_distance * self.p.risk_reward)
             self.traded_today[name] = True
             self._enter_trade(d, name, True, price, sl, tp, sl_distance)
 
-        # Breakout below lower BB = short
-        elif price < bb_lo:
+        # Breakout below lower BB = short (with EMA trend confirmation)
+        elif price < bb_lo and price < ema_val:
             sl_distance = min(atr_val * 1.5, self.p.max_sl_pips * pip_size)
             sl = price + sl_distance
             tp = price - (sl_distance * self.p.risk_reward)

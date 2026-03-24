@@ -22,10 +22,10 @@ from strategies.ftmo_base import FTMOBase
 class RSIDivergence(FTMOBase):
     params = (
         ("rsi_period", 14),
-        ("rsi_extreme_low", 35),     # RSI must be below this for bullish div
-        ("rsi_extreme_high", 65),    # RSI must be above this for bearish div
-        ("swing_lookback", 5),       # bars each side for swing detection
-        ("max_swing_distance", 50),  # max bars between the two swing points
+        ("rsi_extreme_low", 40),     # was 35 — widened to catch more divergences
+        ("rsi_extreme_high", 60),    # was 65
+        ("swing_lookback", 3),       # was 5 — smaller = more swings detected
+        ("max_swing_distance", 60),  # was 50 — allow slightly older divergences
         ("risk_reward", 2.0),
         ("risk_pct", config.RISK_PER_TRADE_PCT),
         ("max_sl_pips", 40),
@@ -33,15 +33,12 @@ class RSIDivergence(FTMOBase):
         ("atr_sl_mult", 1.5),
         ("session_start", 7),
         ("session_end", 20),
-        ("bb_period", 20),
-        ("bb_std", 2.0),
     )
 
     def __init__(self):
         self._init_ftmo()
         self.rsi = {}
         self.atr = {}
-        self.bb = {}
         self.traded_today = {}
         self.current_date = {}
         # Track recent swing lows/highs for divergence detection
@@ -54,9 +51,6 @@ class RSIDivergence(FTMOBase):
             name = d._name
             self.rsi[name] = bt.indicators.RSI(d.close, period=self.p.rsi_period)
             self.atr[name] = bt.indicators.ATR(d, period=self.p.atr_period)
-            self.bb[name] = bt.indicators.BollingerBands(
-                d.close, period=self.p.bb_period, devfactor=self.p.bb_std
-            )
             self.traded_today[name] = False
             self.current_date[name] = None
             self.price_swing_lows[name] = []
@@ -147,7 +141,6 @@ class RSIDivergence(FTMOBase):
             return
 
         price = d.close[0]
-        bb = self.bb[name]
 
         # --- Check for bullish divergence ---
         # Price lower low + RSI higher low + RSI in oversold zone
@@ -161,8 +154,7 @@ class RSIDivergence(FTMOBase):
             if (distance <= self.p.max_swing_distance and
                     curr_price < prev_price and          # price lower low
                     curr_rsi > prev_rsi and              # RSI higher low
-                    curr_rsi < self.p.rsi_extreme_low and  # RSI oversold
-                    price <= bb.lines.bot[0]):            # at/below lower BB
+                    curr_rsi < self.p.rsi_extreme_low):  # RSI oversold
 
                 sl_distance = min(atr_val * self.p.atr_sl_mult, self.p.max_sl_pips * pip_size)
                 sl = price - sl_distance
@@ -183,8 +175,7 @@ class RSIDivergence(FTMOBase):
             if (distance <= self.p.max_swing_distance and
                     curr_price > prev_price and          # price higher high
                     curr_rsi < prev_rsi and              # RSI lower high
-                    curr_rsi > self.p.rsi_extreme_high and  # RSI overbought
-                    price >= bb.lines.top[0]):            # at/above upper BB
+                    curr_rsi > self.p.rsi_extreme_high): # RSI overbought
 
                 sl_distance = min(atr_val * self.p.atr_sl_mult, self.p.max_sl_pips * pip_size)
                 sl = price + sl_distance

@@ -21,16 +21,17 @@ from strategies.ftmo_base import FTMOBase
 
 class FVG(FTMOBase):
     params = (
-        ("risk_reward", 2.5),
+        ("risk_reward", 2.0),           # was 2.5 — more wins at 2.0
         ("risk_pct", config.RISK_PER_TRADE_PCT),
         ("max_sl_pips", 40),
-        ("min_impulse_atr_mult", 1.5),  # impulse candle must be >= 1.5x ATR
+        ("min_impulse_atr_mult", 1.3),  # impulse candle body >= 1.3x ATR
         ("max_fvg_age", 48),            # FVG expires after 48 bars (12 hours on 15min)
-        ("max_open_fvgs", 8),           # track up to 8 open FVGs per pair
+        ("max_open_fvgs", 10),          # track up to 10 open FVGs per pair
         ("atr_period", 14),
         ("session_start", 7),
         ("session_end", 20),
         ("ema_period", 50),             # trend filter
+        ("min_gap_atr_ratio", 0.3),     # FVG gap must be >= 0.3x ATR to filter noise
     )
 
     def __init__(self):
@@ -93,9 +94,12 @@ class FVG(FTMOBase):
         c3_high = d.high[0]
         c3_low = d.low[0]
 
+        min_gap = atr_val * self.p.min_gap_atr_ratio
+
         # Bullish FVG: gap between candle 1 high and candle 3 low
         if c3_low > c1_high and c2_body >= atr_val * self.p.min_impulse_atr_mult:
-            if len(self.fvgs[name]) < self.p.max_open_fvgs:
+            gap = c3_low - c1_high
+            if gap >= min_gap and len(self.fvgs[name]) < self.p.max_open_fvgs:
                 self.fvgs[name].append({
                     "type": "bullish",
                     "top": c3_low,      # top of gap
@@ -105,7 +109,8 @@ class FVG(FTMOBase):
 
         # Bearish FVG: gap between candle 3 high and candle 1 low
         if c3_high < c1_low and c2_body >= atr_val * self.p.min_impulse_atr_mult:
-            if len(self.fvgs[name]) < self.p.max_open_fvgs:
+            gap = c1_low - c3_high
+            if gap >= min_gap and len(self.fvgs[name]) < self.p.max_open_fvgs:
                 self.fvgs[name].append({
                     "type": "bearish",
                     "top": c1_low,      # top of gap

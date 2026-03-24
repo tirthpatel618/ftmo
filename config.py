@@ -59,7 +59,7 @@ BB_SQUEEZE_PAIRS = ["EURUSD", "GBPUSD", "GBPJPY", "EURJPY"]
 FVG_PAIRS = ["EURUSD", "GBPUSD", "GBPJPY", "EURJPY"]
 
 # ── RSI Divergence Parameters ───────────────────────────────
-RSI_DIV_PAIRS = ["EURCHF", "AUDNZD", "EURGBP", "EURUSD"]
+RSI_DIV_PAIRS = ["EURCHF", "AUDNZD", "EURGBP", "EURUSD", "GBPUSD", "GBPJPY", "EURJPY"]
 
 # ── MTF London Breakout Parameters ──────────────────────────
 MTF_LONDON_PAIRS = ["EURUSD", "GBPUSD", "GBPJPY", "EURJPY"]
