@@ -10,28 +10,15 @@ import config
 from engine.backtester import run_backtest, simulate_ftmo_challenges
 from engine.reporter import print_backtest_report, print_simulation_report, console
 from strategies.london_breakout import LondonBreakout
-from strategies.mean_reversion import MeanReversion
-from strategies.ny_momentum import NYMomentum
 from strategies.bb_squeeze import BBSqueeze
 from strategies.fvg import FVG
-from strategies.rsi_divergence import RSIDivergence
-from strategies.mtf_london_breakout import MTFLondonBreakout
+from strategies.ensemble import Ensemble
 
 STRATEGIES = {
     "london": {
         "class": LondonBreakout,
         "pairs": config.LONDON_BREAKOUT_PAIRS,
         "name": "London Session Breakout",
-    },
-    "mean_reversion": {
-        "class": MeanReversion,
-        "pairs": config.MEAN_REVERSION_PAIRS,
-        "name": "Mean Reversion (Ranging Pairs)",
-    },
-    "ny_momentum": {
-        "class": NYMomentum,
-        "pairs": config.NY_MOMENTUM_PAIRS,
-        "name": "NY Session Momentum",
     },
     "bb_squeeze": {
         "class": BBSqueeze,
@@ -43,15 +30,10 @@ STRATEGIES = {
         "pairs": config.FVG_PAIRS,
         "name": "ICT Fair Value Gap",
     },
-    "rsi_divergence": {
-        "class": RSIDivergence,
-        "pairs": config.RSI_DIV_PAIRS,
-        "name": "RSI Divergence",
-    },
-    "mtf_london": {
-        "class": MTFLondonBreakout,
-        "pairs": config.MTF_LONDON_PAIRS,
-        "name": "MTF London Breakout",
+    "ensemble": {
+        "class": Ensemble,
+        "pairs": config.ENSEMBLE_PAIRS,
+        "name": "Ensemble (ER + LB + Squeeze)",
     },
 }
 
@@ -84,15 +66,19 @@ PARAM_GRIDS = {
         "ema_period": [30, 50, 100],
         "min_gap_atr_ratio": [0.2, 0.3, 0.5],
     },
-    "rsi_divergence": {
-        "rsi_extreme_low": [30, 35, 40],
-        "rsi_extreme_high": [60, 65, 70],
-        "swing_lookback": [2, 3, 5],
-        "max_swing_distance": [30, 50, 70],
-        "risk_reward": [1.5, 2.0, 2.5, 3.0],
-        "risk_pct": [0.01, 0.015, 0.02, 0.03],
-        "atr_sl_mult": [1.0, 1.5, 2.0],
-    },
+    "ensemble": {
+        # Shared risk — most impactful param
+        "risk_pct": [0.01, 0.015, 0.02, 0.025, 0.03],
+        # ER: z_threshold controls trade frequency vs quality
+        "er_z_threshold": [1.5, 2.0, 2.5],
+        "er_risk_reward": [1.5, 2.0, 2.5],
+        # LB: R:R and range filter are the biggest levers
+        "lb_risk_reward": [1.5, 2.0, 2.5, 3.0],
+        "lb_min_range_pips": [15, 20, 30],
+        # SQ: squeeze duration and R:R
+        "sq_squeeze_min_bars": [3, 4, 6],
+        "sq_risk_reward": [1.5, 2.0, 2.5],
+    },  # 5*3*3*4*3*3*3 = 4860 combos
 }
 
 
@@ -227,7 +213,7 @@ Commands:
   optimize <strategy> [n]        Optimize params (n = max combos, default 300)
   all                            Run all strategies and compare
 
-Strategies: london, mean_reversion, ny_momentum
+Strategies: london, bb_squeeze, fvg, ensemble
     """
 
     if len(sys.argv) < 2:

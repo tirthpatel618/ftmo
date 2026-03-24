@@ -18,7 +18,7 @@ echo ""
 
 mkdir -p results
 
-for STRATEGY in london bb_squeeze fvg rsi_divergence; do
+for STRATEGY in london bb_squeeze fvg ensemble; do
     echo "=========================================="
     echo "Optimizing: $STRATEGY"
     echo "=========================================="

@@ -64,6 +64,13 @@ RSI_DIV_PAIRS = ["EURCHF", "AUDNZD", "EURGBP", "EURUSD", "GBPUSD", "GBPJPY", "EU
 # ── MTF London Breakout Parameters ──────────────────────────
 MTF_LONDON_PAIRS = ["EURUSD", "GBPUSD", "GBPJPY", "EURJPY"]
 
+# ── Extreme Reversion Parameters ────────────────────────────
+EXTREME_REVERSION_PAIRS = ["AUDNZD", "EURCHF", "EURGBP", "EURUSD", "GBPUSD", "USDCAD"]
+
+# ── Ensemble Strategy ───────────────────────────────────────
+# Uses all pairs that any sub-strategy trades
+ENSEMBLE_PAIRS = ["EURUSD", "GBPUSD", "GBPJPY", "EURJPY", "AUDNZD", "EURCHF", "EURGBP", "USDCAD"]
+
 # ── Backtesting ──────────────────────────────────────────────
 COMMISSION_PIPS = 1.0      # FTMO provides tight spreads (~1 pip for majors)
 DATA_DIR = "data/raw"
