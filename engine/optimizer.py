@@ -75,7 +75,7 @@ def optimize_strategy(
     param_grid: dict,
     start_date: str = None,
     end_date: str = None,
-    max_combos: int = 500,
+    max_combos: int = 200,
     max_workers: int = 4,
 ) -> list[dict]:
     """
@@ -130,13 +130,16 @@ def optimize_strategy(
                 r["score"] = score_result(r)
                 results.append(r)
 
-            if completed % 50 == 0 or completed == len(all_combos):
+            if completed % 25 == 0 or completed == len(all_combos):
                 elapsed = time.time() - start_time
                 rate = completed / elapsed
                 eta = (len(all_combos) - completed) / rate if rate > 0 else 0
                 valid = len(results)
-                print(f"  {completed}/{len(all_combos)} done ({valid} valid), "
-                      f"ETA: {eta:.0f}s")
+                best_score = max((r["score"] for r in results), default=0)
+                best_exp = max((r["expectancy"] for r in results), default=0)
+                print(f"  {completed}/{len(all_combos)} done ({valid} valid) | "
+                      f"best score: {best_score:.1f} | best exp: ${best_exp:.2f} | "
+                      f"rate: {rate:.1f}/s | ETA: {eta:.0f}s")
 
     # Sort by score
     results.sort(key=lambda r: r["score"], reverse=True)

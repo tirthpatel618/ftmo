@@ -6,7 +6,7 @@
 #   max_combos: max parameter combinations per strategy (default 500)
 #   max_workers: parallel backtest workers (default 4)
 
-MAX_COMBOS=${1:-500}
+MAX_COMBOS=${1:-200}
 MAX_WORKERS=${2:-4}
 
 pip install backtrader rich 2>/dev/null

@@ -131,7 +131,7 @@ def run_simulation(strategy_key: str, num_sims: int = 50):
     return sim_result
 
 
-def run_optimize(strategy_key: str, max_combos: int = 300):
+def run_optimize(strategy_key: str, max_combos: int = 200):
     from engine.optimizer import optimize_strategy, walk_forward_validate, print_top_results
 
     strat = STRATEGIES[strategy_key]
