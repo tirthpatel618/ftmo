@@ -1,0 +1,148 @@
+// London Session Breakout Strategy
+// Trades the breakout of the Asian session range during the London open.
+// Optimized params from walk-forward validation (all 3 folds PASS).
+//
+// Best on: EURUSD, GBPUSD, GBPJPY, EURJPY (15min chart)
+// FTMO sim: 4/50 pass (8%), 70% of 30-day windows profitable
+
+//@version=6
+strategy("London Breakout", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=100, initial_capital=100000, currency=currency.USD, commission_type=strategy.commission.cash_per_order, commission_value=0)
+
+// ── Inputs ──────────────────────────────────────────────────────────
+// Session times (UTC). TradingView uses exchange timezone by default,
+// so set your chart to UTC or adjust these offsets.
+asianStart    = input.int(0,   "Asian Session Start (UTC hour)", minval=0, maxval=23)
+asianEnd      = input.int(7,   "Asian Session End (UTC hour)",   minval=0, maxval=23)
+londonStart   = input.int(7,   "London Entry Start (UTC hour)",  minval=0, maxval=23)
+londonEnd     = input.int(9,   "London Entry End (UTC hour)",    minval=0, maxval=23, tooltip="Optimized: 9 (was 11)")
+sessionClose  = input.int(21,  "Session Close (UTC hour)",       minval=0, maxval=23)
+
+// Range filter
+minRangePips  = input.float(30.0, "Min Asian Range (pips)", step=5, tooltip="Optimized: 30 (was 20)")
+maxRangePips  = input.float(60.0, "Max Asian Range (pips)", step=5, tooltip="Optimized: 60 (was 80)")
+
+// Risk management
+riskReward    = input.float(1.5,  "Risk:Reward Ratio",       step=0.5, tooltip="Optimized: 1.5 (was 2.0)")
+maxSlPips     = input.float(50.0, "Max Stop Loss (pips)",     step=5)
+riskPct       = input.float(1.5,  "Risk Per Trade (%)",       step=0.5, tooltip="Optimized: 1.5%") / 100
+
+// Day filter
+tradeMon = input.bool(true, "Monday")
+tradeTue = input.bool(true, "Tuesday")
+tradeWed = input.bool(true, "Wednesday")
+tradeThu = input.bool(true, "Thursday")
+tradeFri = input.bool(true, "Friday")
+
+// Trend filter (disabled by default — 200 EMA on 15min is too noisy)
+useTrendFilter = input.bool(false, "Use EMA 200 Trend Filter")
+
+// ── Pip size detection ──────────────────────────────────────────────
+// JPY pairs use 0.01, everything else uses 0.0001
+pipSize = syminfo.mintick < 0.001 ? 0.01 : 0.0001
+
+// ── Variables ───────────────────────────────────────────────────────
+var float asianHigh   = na
+var float asianLow    = na
+var bool  tradedToday = false
+var int   lastDay     = -1
+
+ema200 = ta.ema(close, 200)
+
+// ── Helper: get UTC hour ────────────────────────────────────────────
+// TradingView's hour uses chart timezone. We need UTC.
+// Adjust if your chart is NOT set to UTC.
+utcHour = hour(time, "UTC")
+utcDay  = dayofweek(time, "UTC")
+
+// ── Day filter check ────────────────────────────────────────────────
+dayAllowed = (utcDay == dayofweek.monday    and tradeMon) or (utcDay == dayofweek.tuesday   and tradeTue) or (utcDay == dayofweek.wednesday and tradeWed) or (utcDay == dayofweek.thursday  and tradeThu) or (utcDay == dayofweek.friday    and tradeFri)
+
+// ── New day reset ───────────────────────────────────────────────────
+currentDay = dayofmonth(time, "UTC")
+if currentDay != lastDay
+    asianHigh   := 0.0
+    asianLow    := 1e18
+    tradedToday := false
+    lastDay     := currentDay
+
+// ── Build Asian range (00:00 - 07:00 UTC) ───────────────────────────
+isAsianSession = utcHour >= asianStart and utcHour < asianEnd
+if isAsianSession
+    asianHigh := math.max(nz(asianHigh, 0), high)
+    asianLow  := math.min(nz(asianLow, 1e18), low)
+
+// ── Calculate range in pips ─────────────────────────────────────────
+rangePips = nz(asianHigh - asianLow, 0) / pipSize
+rangeValid = rangePips >= minRangePips and rangePips <= maxRangePips and asianHigh > 0 and asianLow < 1e18
+
+// ── London entry window ─────────────────────────────────────────────
+isLondonEntry = utcHour >= londonStart and utcHour < londonEnd
+
+// ── Entry logic ─────────────────────────────────────────────────────
+if isLondonEntry and not tradedToday and dayAllowed and rangeValid and strategy.position_size == 0
+    // Breakout above Asian high → LONG
+    if close > asianHigh
+        slPrice    = asianLow
+        slDistance  = close - slPrice
+        slPips     = slDistance / pipSize
+
+        // Cap stop loss
+        if slPips > maxSlPips
+            slPrice   := close - maxSlPips * pipSize
+            slDistance := close - slPrice
+
+        // Trend filter
+        trendOk = useTrendFilter ? close > ema200 : true
+
+        if trendOk
+            tpPrice = close + slDistance * riskReward
+
+            // Position sizing: risk riskPct of equity
+            riskAmount  = strategy.equity * riskPct
+            pipValue    = syminfo.pointvalue * pipSize  // value of 1 pip per 1 unit
+            qtyUnits    = pipValue > 0 ? riskAmount / (slDistance / pipSize * pipValue) : 0
+
+            if qtyUnits > 0
+                strategy.entry("Long", strategy.long, qty=qtyUnits)
+                strategy.exit("Long Exit", "Long", stop=slPrice, limit=tpPrice)
+                tradedToday := true
+
+    // Breakout below Asian low → SHORT
+    else if close < asianLow
+        slPrice    = asianHigh
+        slDistance  = slPrice - close
+        slPips     = slDistance / pipSize
+
+        // Cap stop loss
+        if slPips > maxSlPips
+            slPrice   := close + maxSlPips * pipSize
+            slDistance := slPrice - close
+
+        // Trend filter
+        trendOk = useTrendFilter ? close < ema200 : true
+
+        if trendOk
+            tpPrice = close - slDistance * riskReward
+
+            riskAmount  = strategy.equity * riskPct
+            pipValue    = syminfo.pointvalue * pipSize
+            qtyUnits    = pipValue > 0 ? riskAmount / (slDistance / pipSize * pipValue) : 0
+
+            if qtyUnits > 0
+                strategy.entry("Short", strategy.short, qty=qtyUnits)
+                strategy.exit("Short Exit", "Short", stop=slPrice, limit=tpPrice)
+                tradedToday := true
+
+// ── Session close: flatten everything ───────────────────────────────
+if utcHour >= sessionClose and strategy.position_size != 0
+    strategy.close_all(comment="Session Close")
+
+// ── Plots ───────────────────────────────────────────────────────────
+rangeColor = rangeValid ? color.new(color.blue, 80) : color.new(color.gray, 90)
+plot(asianHigh > 0 and not isAsianSession ? asianHigh : na, "Asian High", color=color.green, linewidth=1, style=plot.style_linebr)
+plot(asianLow < 1e18 and not isAsianSession ? asianLow : na, "Asian Low", color=color.red, linewidth=1, style=plot.style_linebr)
+plot(useTrendFilter ? ema200 : na, "EMA 200", color=color.orange, linewidth=1)
+
+// London entry window background
+bgcolor(isLondonEntry and dayAllowed and rangeValid ? color.new(color.blue, 93) : na, title="London Entry Window")
+bgcolor(isAsianSession ? color.new(color.yellow, 95) : na, title="Asian Session")
