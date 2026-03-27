@@ -19,6 +19,7 @@ import urllib.request
 import urllib.parse
 import json
 import os
+import ssl
 from datetime import datetime, timezone, timedelta
 
 # ── Optimized Parameters (walk-forward validated, score 163.8) ───────
@@ -102,7 +103,10 @@ def send_telegram(message):
             "parse_mode": "HTML",
         }).encode()
         req = urllib.request.Request(url, data=data)
-        urllib.request.urlopen(req, timeout=10)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        urllib.request.urlopen(req, timeout=10, context=ctx)
     except Exception as e:
         log.error(f"Telegram send failed: {e}")
 
@@ -162,6 +166,15 @@ class LondonBreakoutBot:
                 mt5.symbol_select(pair, True)
 
         self._update_day_start_balance()
+
+        mode = "DRY RUN" if self.dry_run else "LIVE"
+        send_telegram(
+            f"<b>Bot Started</b>\n"
+            f"Mode: {mode}\n"
+            f"Account: {info.login} | {info.server}\n"
+            f"Balance: ${info.balance:,.2f}\n"
+            f"Pairs: {', '.join(self.pairs)}"
+        )
         return True
 
     def run(self):
