@@ -577,8 +577,8 @@ class LondonBreakoutBot:
         if streak:
             msg += f"\n{streak}"
 
-        # FTMO progress (assuming $100K challenge, 10% target)
-        initial_balance = 100000  # adjust for your challenge size
+        # FTMO progress (assuming $120K account, 10% target)
+        initial_balance = 120000
         total_return_pct = (balance - initial_balance) / initial_balance * 100
         msg += f"\n\n<b>FTMO Progress:</b> {total_return_pct:+.1f}% / 10.0% target"
 
