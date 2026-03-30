@@ -388,10 +388,11 @@ class LondonBreakoutBot:
             log.error(f"Order rejected: retcode={result.retcode} comment={result.comment}")
             return False
 
-        log.info(f"Order filled: ticket={result.order} | {direction} {lots} {pair} @ {result.price}")
+        fill_price = result.price if result.price > 0 else price
+        log.info(f"Order filled: ticket={result.order} | {direction} {lots} {pair} @ {fill_price}")
         send_telegram(
             f"<b>TRADE</b> {direction.upper()} {pair}\n"
-            f"Lots: {lots} | Entry: {result.price}\n"
+            f"Lots: {lots} | Entry: {fill_price}\n"
             f"SL: {sl} ({sl_pips:.0f} pips) | TP: {tp} ({tp_pips:.0f} pips)"
         )
         return True
