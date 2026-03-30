@@ -132,6 +132,9 @@ class LondonBreakoutBot:
         self.daily_trades = []  # list of {pair, direction, entry, sl, tp, lots, time}
         self.daily_summary_sent = False
 
+        # Track open positions to detect SL/TP closes
+        self.tracked_positions = {}  # ticket -> {pair, direction, entry, sl, tp, lots, open_time}
+
         for pair in self.pairs:
             self.asian_high[pair] = 0.0
             self.asian_low[pair] = float("inf")
@@ -206,6 +209,9 @@ class LondonBreakoutBot:
         # Daily reset
         if self.day_start_date != today:
             self._reset_day(today)
+
+        # Check if any open trades hit SL/TP
+        self._check_closed_positions()
 
         # Check daily loss circuit breaker
         if self._daily_loss_exceeded():
@@ -395,7 +401,89 @@ class LondonBreakoutBot:
             f"Lots: {lots} | Entry: {fill_price}\n"
             f"SL: {sl} ({sl_pips:.0f} pips) | TP: {tp} ({tp_pips:.0f} pips)"
         )
+
+        # Track position for close detection
+        self.tracked_positions[result.order] = {
+            "pair": pair,
+            "direction": direction,
+            "entry": fill_price,
+            "sl": sl,
+            "tp": tp,
+            "lots": lots,
+            "open_time": datetime.now(timezone.utc),
+        }
         return True
+
+    def _check_closed_positions(self):
+        """Detect when tracked positions close (SL/TP hit) and alert."""
+        if not self.tracked_positions:
+            return
+
+        # Get all currently open position tickets for our magic
+        open_tickets = set()
+        positions = mt5.positions_get()
+        if positions:
+            for p in positions:
+                if p.magic == self.magic:
+                    open_tickets.add(p.ticket)
+
+        # Check which tracked positions are no longer open
+        closed_tickets = [t for t in self.tracked_positions if t not in open_tickets]
+
+        for ticket in closed_tickets:
+            info = self.tracked_positions.pop(ticket)
+            pip_size = PIP_SIZES.get(info["pair"], 0.0001)
+
+            # Look up the closed deal in history for exact P/L
+            now = datetime.now(timezone.utc)
+            day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            deals = mt5.history_deals_get(day_start, now)
+
+            profit = 0.0
+            close_price = 0.0
+            close_reason = "Unknown"
+
+            if deals:
+                for d in deals:
+                    if d.position_id == ticket and d.entry == mt5.DEAL_ENTRY_OUT:
+                        profit = d.profit + d.commission + d.swap
+                        close_price = d.price
+                        # Determine close reason
+                        if d.reason == 3:  # DEAL_REASON_SL
+                            close_reason = "Stop Loss"
+                        elif d.reason == 4:  # DEAL_REASON_TP
+                            close_reason = "Take Profit"
+                        elif d.reason == 0:  # DEAL_REASON_CLIENT
+                            close_reason = "Manual/Bot Close"
+                        else:
+                            close_reason = f"Reason {d.reason}"
+                        break
+
+            # Calculate pips gained/lost
+            if info["direction"] == "buy":
+                pips_result = (close_price - info["entry"]) / pip_size if close_price > 0 else 0
+            else:
+                pips_result = (info["entry"] - close_price) / pip_size if close_price > 0 else 0
+
+            duration = now - info["open_time"]
+            hours = duration.total_seconds() / 3600
+
+            result_label = "WIN" if profit > 0 else "LOSS" if profit < 0 else "BE"
+
+            log.info(
+                f"CLOSED: {info['direction'].upper()} {info['pair']} | "
+                f"{close_reason} | P/L: ${profit:+,.2f} ({pips_result:+.0f} pips) | "
+                f"Duration: {hours:.1f}h"
+            )
+
+            send_telegram(
+                f"<b>CLOSED — {result_label}</b>\n"
+                f"{info['direction'].upper()} {info['pair']} | {info['lots']} lots\n"
+                f"Reason: {close_reason}\n"
+                f"Entry: {info['entry']} → Exit: {close_price}\n"
+                f"P/L: <code>${profit:+,.2f}</code> ({pips_result:+.0f} pips)\n"
+                f"Duration: {hours:.1f}h"
+            )
 
     def _has_position(self, pair):
         """Check if we already have an open position on this pair."""
