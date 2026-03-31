@@ -41,6 +41,22 @@ PARAMS = {
 
 DEFAULT_PAIRS = ["EURUSD", "GBPUSD", "GBPJPY", "EURJPY"]
 
+# ── Extreme Reversion Parameters ─────────────────────────────────────
+ER_PARAMS = {
+    "pairs": ["AUDNZD", "EURCHF"],
+    "lookback": 40,            # rolling window for z-score
+    "z_threshold": 1.5,        # enter when |z| > this
+    "risk_reward": 2.0,
+    "risk_pct": 0.015,         # 1.5% per trade
+    "max_sl_pips": 30,
+    "sl_buffer_atr_mult": 0.5, # SL = extreme wick + 0.5 ATR
+    "atr_period": 14,
+    "session_start_utc": 3,    # include late Asian for range pairs
+    "session_end_utc": 20,
+    "cooldown_bars": 2,        # min bars between trades on same pair
+    "magic": 100002,
+}
+
 # ── Telegram Notifications ───────────────────────────────────────────
 # Set in .env file (same directory as this script):
 #   TELEGRAM_BOT_TOKEN=7123456789:AAH...
@@ -118,7 +134,7 @@ class LondonBreakoutBot:
         self.p = params or PARAMS
         self.magic = self.p["magic"]
 
-        # Per-pair state
+        # Per-pair state (London Breakout)
         self.asian_high = {}
         self.asian_low = {}
         self.traded_today = {}
@@ -129,7 +145,7 @@ class LondonBreakoutBot:
         self.day_start_date = None
 
         # Daily trade log for summary
-        self.daily_trades = []  # list of {pair, direction, entry, sl, tp, lots, time}
+        self.daily_trades = []
         self.daily_summary_sent = False
 
         # Track open positions to detect SL/TP closes
@@ -140,6 +156,24 @@ class LondonBreakoutBot:
             self.asian_low[pair] = float("inf")
             self.traded_today[pair] = False
             self.current_date[pair] = None
+
+        # ── Extreme Reversion state ──────────────────────────────────
+        self.er = ER_PARAMS
+        self.er_return_history = {}   # pair -> list of recent bar returns
+        self.er_bars_since_trade = {} # pair -> int
+        self.er_last_bar_time = {}    # pair -> datetime (avoid double-processing)
+        for pair in self.er["pairs"]:
+            self.er_return_history[pair] = []
+            self.er_bars_since_trade[pair] = 999
+            self.er_last_bar_time[pair] = None
+            # Ensure symbol is visible in MT5
+            if not dry_run:
+                try:
+                    sym = mt5.symbol_info(pair)
+                    if sym and not sym.visible:
+                        mt5.symbol_select(pair, True)
+                except Exception:
+                    pass
 
     def connect(self):
         """Initialize connection to MT5 terminal."""
@@ -158,8 +192,9 @@ class LondonBreakoutBot:
         log.info(f"Mode: {'DRY RUN' if self.dry_run else 'LIVE TRADING'}")
         log.info(f"Pairs: {', '.join(self.pairs)}")
 
-        # Verify all symbols are available
-        for pair in self.pairs:
+        # Verify all symbols are available (LB + ER pairs)
+        all_pairs = list(set(self.pairs + self.er["pairs"]))
+        for pair in all_pairs:
             sym = mt5.symbol_info(pair)
             if sym is None:
                 log.error(f"Symbol {pair} not found. Check broker symbol names.")
@@ -176,7 +211,8 @@ class LondonBreakoutBot:
             f"Mode: {mode}\n"
             f"Account: {info.login} | {info.server}\n"
             f"Balance: ${info.balance:,.2f}\n"
-            f"Pairs: {', '.join(self.pairs)}"
+            f"LB Pairs: {', '.join(self.pairs)}\n"
+            f"ER Pairs: {', '.join(self.er['pairs'])}"
         )
         return True
 
@@ -242,6 +278,16 @@ class LondonBreakoutBot:
             elif hour >= self.p["session_close_utc"]:
                 self._close_position(pair)
 
+        # ── Extreme Reversion: runs independently on different pairs ────
+        if self.er["session_start_utc"] <= hour < self.er["session_end_utc"]:
+            if weekday in self.p["day_filter"]:
+                for pair in self.er["pairs"]:
+                    self._check_extreme_reversion(pair)
+        elif hour >= self.p["session_close_utc"]:
+            # Close any ER positions at session end
+            for pair in self.er["pairs"]:
+                self._close_position(pair, magic=self.er["magic"])
+
         # Send daily summary once after session close
         if hour >= self.p["session_close_utc"]:
             self._send_daily_summary()
@@ -254,6 +300,111 @@ class LondonBreakoutBot:
         bar = rates[0]
         self.asian_high[pair] = max(self.asian_high[pair], bar["high"])
         self.asian_low[pair] = min(self.asian_low[pair], bar["low"])
+
+    def _check_extreme_reversion(self, pair):
+        """Check for extreme z-score move and fade it."""
+        # Get last 2 completed bars (index 1 = last closed bar)
+        rates = mt5.copy_rates_from_pos(pair, mt5.TIMEFRAME_M15, 1, self.er["lookback"] + 1)
+        if rates is None or len(rates) < self.er["lookback"]:
+            return
+
+        # Avoid processing same bar twice
+        bar_time = datetime.fromtimestamp(rates[-1]["time"], tz=timezone.utc)
+        if self.er_last_bar_time.get(pair) == bar_time:
+            return
+        self.er_last_bar_time[pair] = bar_time
+
+        # Cooldown check
+        self.er_bars_since_trade[pair] += 1
+        if self.er_bars_since_trade[pair] < self.er["cooldown_bars"]:
+            return
+
+        # Already have ER position on this pair?
+        positions = mt5.positions_get(symbol=pair)
+        if positions and any(p.magic == self.er["magic"] for p in positions):
+            return
+
+        # Calculate returns for all bars
+        returns = []
+        for i in range(1, len(rates)):
+            if rates[i - 1]["open"] == 0:
+                returns.append(0)
+            else:
+                returns.append((rates[i]["close"] - rates[i]["open"]) / rates[i]["open"])
+
+        if len(returns) < self.er["lookback"]:
+            return
+
+        # Z-score of the latest bar
+        recent = returns[-self.er["lookback"]:]
+        mean_ret = sum(recent) / len(recent)
+        var = sum((r - mean_ret) ** 2 for r in recent) / len(recent)
+        std_ret = var ** 0.5
+
+        if std_ret == 0:
+            return
+
+        latest_return = returns[-1]
+        z_score = (latest_return - mean_ret) / std_ret
+
+        if abs(z_score) < self.er["z_threshold"]:
+            return
+
+        # Calculate ATR for SL buffer
+        atr_sum = 0
+        for i in range(-self.er["atr_period"], 0):
+            atr_sum += rates[i]["high"] - rates[i]["low"]
+        atr = atr_sum / self.er["atr_period"]
+
+        pip_size = PIP_SIZES.get(pair, 0.0001)
+        last_bar = rates[-1]
+        tick = mt5.symbol_info_tick(pair)
+        if tick is None:
+            return
+
+        if z_score > self.er["z_threshold"]:
+            # Extreme UP → SHORT (fade)
+            price = tick.bid
+            sl = last_bar["high"] + atr * self.er["sl_buffer_atr_mult"]
+            sl_distance = sl - price
+            sl_pips = sl_distance / pip_size
+
+            if sl_pips > self.er["max_sl_pips"]:
+                sl = price + self.er["max_sl_pips"] * pip_size
+                sl_distance = sl - price
+
+            if sl_distance <= 0:
+                return
+
+            tp = price - sl_distance * self.er["risk_reward"]
+            lots = self._calc_lot_size(pair, sl_distance, self.er["risk_pct"])
+
+            if lots > 0:
+                log.info(f"ER SIGNAL: z={z_score:.1f} | SELL {pair}")
+                self._place_trade(pair, "sell", price, sl, tp, lots, magic=self.er["magic"], tag="ER")
+                self.er_bars_since_trade[pair] = 0
+
+        elif z_score < -self.er["z_threshold"]:
+            # Extreme DOWN → LONG (fade)
+            price = tick.ask
+            sl = last_bar["low"] - atr * self.er["sl_buffer_atr_mult"]
+            sl_distance = price - sl
+            sl_pips = sl_distance / pip_size
+
+            if sl_pips > self.er["max_sl_pips"]:
+                sl = price - self.er["max_sl_pips"] * pip_size
+                sl_distance = price - sl
+
+            if sl_distance <= 0:
+                return
+
+            tp = price + sl_distance * self.er["risk_reward"]
+            lots = self._calc_lot_size(pair, sl_distance, self.er["risk_pct"])
+
+            if lots > 0:
+                log.info(f"ER SIGNAL: z={z_score:.1f} | BUY {pair}")
+                self._place_trade(pair, "buy", price, sl, tp, lots, magic=self.er["magic"], tag="ER")
+                self.er_bars_since_trade[pair] = 0
 
     def _check_breakout(self, pair):
         """Check for breakout above/below Asian range."""
@@ -307,13 +458,13 @@ class LondonBreakoutBot:
                 self._place_trade(pair, "sell", tick.bid, sl, tp, lots)
                 self.traded_today[pair] = True
 
-    def _calc_lot_size(self, pair, sl_distance):
+    def _calc_lot_size(self, pair, sl_distance, risk_pct=None):
         """Calculate lot size based on risk percentage."""
         account = mt5.account_info()
         if account is None:
             return 0.0
 
-        risk_amount = account.balance * self.p["risk_pct"]
+        risk_amount = account.balance * (risk_pct or self.p["risk_pct"])
 
         sym = mt5.symbol_info(pair)
         if sym is None:
@@ -345,8 +496,9 @@ class LondonBreakoutBot:
 
         return lots
 
-    def _place_trade(self, pair, direction, price, sl, tp, lots):
+    def _place_trade(self, pair, direction, price, sl, tp, lots, magic=None, tag="LB"):
         """Place a market order."""
+        use_magic = magic or self.magic
         sym = mt5.symbol_info(pair)
         digits = sym.digits
 
@@ -360,7 +512,7 @@ class LondonBreakoutBot:
 
         log.info(
             f"{'[DRY RUN] ' if self.dry_run else ''}"
-            f"SIGNAL: {direction.upper()} {pair} | {lots} lots | "
+            f"[{tag}] SIGNAL: {direction.upper()} {pair} | {lots} lots | "
             f"Entry: {price} | SL: {sl} ({sl_pips:.0f} pips) | "
             f"TP: {tp} ({tp_pips:.0f} pips)"
         )
@@ -379,8 +531,8 @@ class LondonBreakoutBot:
             "sl": sl,
             "tp": tp,
             "deviation": 10,
-            "magic": self.magic,
-            "comment": "LB_v1",
+            "magic": use_magic,
+            "comment": f"{tag}_v1",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
@@ -395,9 +547,9 @@ class LondonBreakoutBot:
             return False
 
         fill_price = result.price if result.price > 0 else price
-        log.info(f"Order filled: ticket={result.order} | {direction} {lots} {pair} @ {fill_price}")
+        log.info(f"[{tag}] Order filled: ticket={result.order} | {direction} {lots} {pair} @ {fill_price}")
         send_telegram(
-            f"<b>TRADE</b> {direction.upper()} {pair}\n"
+            f"<b>[{tag}] TRADE</b> {direction.upper()} {pair}\n"
             f"Lots: {lots} | Entry: {fill_price}\n"
             f"SL: {sl} ({sl_pips:.0f} pips) | TP: {tp} ({tp_pips:.0f} pips)"
         )
@@ -411,6 +563,7 @@ class LondonBreakoutBot:
             "tp": tp,
             "lots": lots,
             "open_time": datetime.now(timezone.utc),
+            "tag": tag,
         }
         return True
 
@@ -419,12 +572,13 @@ class LondonBreakoutBot:
         if not self.tracked_positions:
             return
 
-        # Get all currently open position tickets for our magic
+        # Get all currently open position tickets for our magics (LB + ER)
+        our_magics = {self.magic, self.er["magic"]}
         open_tickets = set()
         positions = mt5.positions_get()
         if positions:
             for p in positions:
-                if p.magic == self.magic:
+                if p.magic in our_magics:
                     open_tickets.add(p.ticket)
 
         # Check which tracked positions are no longer open
@@ -469,15 +623,16 @@ class LondonBreakoutBot:
             hours = duration.total_seconds() / 3600
 
             result_label = "WIN" if profit > 0 else "LOSS" if profit < 0 else "BE"
+            tag = info.get("tag", "LB")
 
             log.info(
-                f"CLOSED: {info['direction'].upper()} {info['pair']} | "
+                f"[{tag}] CLOSED: {info['direction'].upper()} {info['pair']} | "
                 f"{close_reason} | P/L: ${profit:+,.2f} ({pips_result:+.0f} pips) | "
                 f"Duration: {hours:.1f}h"
             )
 
             send_telegram(
-                f"<b>CLOSED — {result_label}</b>\n"
+                f"<b>[{tag}] CLOSED — {result_label}</b>\n"
                 f"{info['direction'].upper()} {info['pair']} | {info['lots']} lots\n"
                 f"Reason: {close_reason}\n"
                 f"Entry: {info['entry']} → Exit: {close_price}\n"
@@ -492,14 +647,15 @@ class LondonBreakoutBot:
             return False
         return any(p.magic == self.magic for p in positions)
 
-    def _close_position(self, pair):
+    def _close_position(self, pair, magic=None):
         """Close any open position on this pair."""
+        use_magic = magic or self.magic
         positions = mt5.positions_get(symbol=pair)
         if positions is None:
             return
 
         for pos in positions:
-            if pos.magic != self.magic:
+            if pos.magic != use_magic:
                 continue
 
             close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
@@ -522,8 +678,8 @@ class LondonBreakoutBot:
                 "position": pos.ticket,
                 "price": close_price,
                 "deviation": 10,
-                "magic": self.magic,
-                "comment": "LB_close",
+                "magic": use_magic,
+                "comment": "close",
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_IOC,
             }
@@ -605,7 +761,8 @@ class LondonBreakoutBot:
         deals = mt5.history_deals_get(day_start, day_end)
         my_deals = []
         if deals:
-            my_deals = [d for d in deals if d.magic == self.magic and d.entry == mt5.DEAL_ENTRY_OUT]
+            our_magics = {self.magic, self.er["magic"]}
+            my_deals = [d for d in deals if d.magic in our_magics and d.entry == mt5.DEAL_ENTRY_OUT]
 
         total_trades = len(my_deals)
         wins = sum(1 for d in my_deals if d.profit > 0)
