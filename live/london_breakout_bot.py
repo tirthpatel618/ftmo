@@ -45,15 +45,17 @@ DEFAULT_PAIRS = ["EURUSD", "GBPUSD", "GBPJPY", "EURJPY"]
 ER_PARAMS = {
     "pairs": ["AUDNZD", "EURCHF"],
     "lookback": 40,            # rolling window for z-score
-    "z_threshold": 1.5,        # enter when |z| > this
+    "z_threshold": 2.0,        # raised from 1.5 — fewer but higher conviction trades
     "risk_reward": 2.0,
-    "risk_pct": 0.015,         # 1.5% per trade
+    "risk_pct": 0.01,          # 1% per trade (lowered — these are counter-trend)
     "max_sl_pips": 30,
+    "min_sl_pips": 15,         # NEW: floor to prevent tiny SL / massive lots
     "sl_buffer_atr_mult": 0.5, # SL = extreme wick + 0.5 ATR
     "atr_period": 14,
     "session_start_utc": 3,    # include late Asian for range pairs
     "session_end_utc": 20,
-    "cooldown_bars": 2,        # min bars between trades on same pair
+    "cooldown_minutes": 60,    # FIXED: time-based, not tick-based
+    "max_er_trades_per_day": 2, # NEW: cap daily ER trades per pair
     "magic": 100002,
 }
 
@@ -143,6 +145,7 @@ class LondonBreakoutBot:
         # Daily loss tracking
         self.day_start_balance = None
         self.day_start_date = None
+        self.circuit_breaker_hit = False
 
         # Daily trade log for summary
         self.daily_trades = []
@@ -160,11 +163,13 @@ class LondonBreakoutBot:
         # ── Extreme Reversion state ──────────────────────────────────
         self.er = ER_PARAMS
         self.er_return_history = {}   # pair -> list of recent bar returns
-        self.er_bars_since_trade = {} # pair -> int
+        self.er_last_trade_time = {}  # pair -> datetime (cooldown)
+        self.er_daily_trade_count = {} # pair -> int
         self.er_last_bar_time = {}    # pair -> datetime (avoid double-processing)
         for pair in self.er["pairs"]:
             self.er_return_history[pair] = []
-            self.er_bars_since_trade[pair] = 999
+            self.er_last_trade_time[pair] = None
+            self.er_daily_trade_count[pair] = 0
             self.er_last_bar_time[pair] = None
             # Ensure symbol is visible in MT5
             if not dry_run:
@@ -303,21 +308,29 @@ class LondonBreakoutBot:
 
     def _check_extreme_reversion(self, pair):
         """Check for extreme z-score move and fade it."""
-        # Get last 2 completed bars (index 1 = last closed bar)
+        now = datetime.now(timezone.utc)
+
+        # Time-based cooldown (not tick-based)
+        last_trade = self.er_last_trade_time.get(pair)
+        if last_trade:
+            minutes_since = (now - last_trade).total_seconds() / 60
+            if minutes_since < self.er["cooldown_minutes"]:
+                return
+
+        # Daily trade limit per pair
+        if self.er_daily_trade_count.get(pair, 0) >= self.er["max_er_trades_per_day"]:
+            return
+
+        # Get completed bars
         rates = mt5.copy_rates_from_pos(pair, mt5.TIMEFRAME_M15, 1, self.er["lookback"] + 1)
         if rates is None or len(rates) < self.er["lookback"]:
             return
 
-        # Avoid processing same bar twice
+        # Only process once per new bar
         bar_time = datetime.fromtimestamp(rates[-1]["time"], tz=timezone.utc)
         if self.er_last_bar_time.get(pair) == bar_time:
             return
         self.er_last_bar_time[pair] = bar_time
-
-        # Cooldown check
-        self.er_bars_since_trade[pair] += 1
-        if self.er_bars_since_trade[pair] < self.er["cooldown_bars"]:
-            return
 
         # Already have ER position on this pair?
         positions = mt5.positions_get(symbol=pair)
@@ -327,7 +340,7 @@ class LondonBreakoutBot:
         # Calculate returns for all bars
         returns = []
         for i in range(1, len(rates)):
-            if rates[i - 1]["open"] == 0:
+            if rates[i]["open"] == 0:
                 returns.append(0)
             else:
                 returns.append((rates[i]["close"] - rates[i]["open"]) / rates[i]["open"])
@@ -357,6 +370,7 @@ class LondonBreakoutBot:
         atr = atr_sum / self.er["atr_period"]
 
         pip_size = PIP_SIZES.get(pair, 0.0001)
+        min_sl = self.er["min_sl_pips"] * pip_size
         last_bar = rates[-1]
         tick = mt5.symbol_info_tick(pair)
         if tick is None:
@@ -367,44 +381,52 @@ class LondonBreakoutBot:
             price = tick.bid
             sl = last_bar["high"] + atr * self.er["sl_buffer_atr_mult"]
             sl_distance = sl - price
-            sl_pips = sl_distance / pip_size
 
+            # Enforce minimum SL distance
+            if sl_distance < min_sl:
+                sl = price + min_sl
+                sl_distance = min_sl
+
+            # Cap at max SL
+            sl_pips = sl_distance / pip_size
             if sl_pips > self.er["max_sl_pips"]:
                 sl = price + self.er["max_sl_pips"] * pip_size
                 sl_distance = sl - price
-
-            if sl_distance <= 0:
-                return
 
             tp = price - sl_distance * self.er["risk_reward"]
             lots = self._calc_lot_size(pair, sl_distance, self.er["risk_pct"])
 
             if lots > 0:
-                log.info(f"ER SIGNAL: z={z_score:.1f} | SELL {pair}")
+                log.info(f"ER SIGNAL: z={z_score:.1f} | SELL {pair} | SL {sl_pips:.0f} pips")
                 self._place_trade(pair, "sell", price, sl, tp, lots, magic=self.er["magic"], tag="ER")
-                self.er_bars_since_trade[pair] = 0
+                self.er_last_trade_time[pair] = now
+                self.er_daily_trade_count[pair] = self.er_daily_trade_count.get(pair, 0) + 1
 
         elif z_score < -self.er["z_threshold"]:
             # Extreme DOWN → LONG (fade)
             price = tick.ask
             sl = last_bar["low"] - atr * self.er["sl_buffer_atr_mult"]
             sl_distance = price - sl
-            sl_pips = sl_distance / pip_size
 
+            # Enforce minimum SL distance
+            if sl_distance < min_sl:
+                sl = price - min_sl
+                sl_distance = min_sl
+
+            # Cap at max SL
+            sl_pips = sl_distance / pip_size
             if sl_pips > self.er["max_sl_pips"]:
                 sl = price - self.er["max_sl_pips"] * pip_size
                 sl_distance = price - sl
-
-            if sl_distance <= 0:
-                return
 
             tp = price + sl_distance * self.er["risk_reward"]
             lots = self._calc_lot_size(pair, sl_distance, self.er["risk_pct"])
 
             if lots > 0:
-                log.info(f"ER SIGNAL: z={z_score:.1f} | BUY {pair}")
+                log.info(f"ER SIGNAL: z={z_score:.1f} | BUY {pair} | SL {sl_pips:.0f} pips")
                 self._place_trade(pair, "buy", price, sl, tp, lots, magic=self.er["magic"], tag="ER")
-                self.er_bars_since_trade[pair] = 0
+                self.er_last_trade_time[pair] = now
+                self.er_daily_trade_count[pair] = self.er_daily_trade_count.get(pair, 0) + 1
 
     def _check_breakout(self, pair):
         """Check for breakout above/below Asian range."""
@@ -589,9 +611,10 @@ class LondonBreakoutBot:
             pip_size = PIP_SIZES.get(info["pair"], 0.0001)
 
             # Look up the closed deal in history for exact P/L
+            # Search from when the trade opened (not just today) to now
             now = datetime.now(timezone.utc)
-            day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            deals = mt5.history_deals_get(day_start, now)
+            search_start = info["open_time"] - timedelta(minutes=5)
+            deals = mt5.history_deals_get(search_start, now + timedelta(minutes=1))
 
             profit = 0.0
             close_price = 0.0
@@ -599,10 +622,15 @@ class LondonBreakoutBot:
 
             if deals:
                 for d in deals:
-                    if d.position_id == ticket and d.entry == mt5.DEAL_ENTRY_OUT:
+                    # Match by position_id OR by symbol+magic+close entry
+                    is_match = (
+                        d.position_id == ticket or
+                        (d.symbol == info["pair"] and d.entry == mt5.DEAL_ENTRY_OUT
+                         and abs(d.volume - info["lots"]) < 0.1)
+                    )
+                    if is_match and d.entry == mt5.DEAL_ENTRY_OUT:
                         profit = d.profit + d.commission + d.swap
                         close_price = d.price
-                        # Determine close reason
                         if d.reason == 3:  # DEAL_REASON_SL
                             close_reason = "Stop Loss"
                         elif d.reason == 4:  # DEAL_REASON_TP
@@ -612,6 +640,25 @@ class LondonBreakoutBot:
                         else:
                             close_reason = f"Reason {d.reason}"
                         break
+
+            # Fallback: if deal lookup failed, try position history
+            if close_price == 0.0:
+                hist_orders = mt5.history_orders_get(search_start, now + timedelta(minutes=1))
+                if hist_orders:
+                    for o in hist_orders:
+                        if o.position_id == ticket:
+                            close_price = o.price_current if o.price_current > 0 else o.price_open
+                            if o.type == mt5.ORDER_TYPE_BUY or o.type == mt5.ORDER_TYPE_SELL:
+                                if o.comment and "sl" in o.comment.lower():
+                                    close_reason = "Stop Loss"
+                                elif o.comment and "tp" in o.comment.lower():
+                                    close_reason = "Take Profit"
+
+            # Last resort: estimate P/L from entry + current price
+            if profit == 0.0 and close_price == 0.0:
+                tick = mt5.symbol_info_tick(info["pair"])
+                if tick:
+                    close_price = tick.bid if info["direction"] == "buy" else tick.ask
 
             # Calculate pips gained/lost
             if info["direction"] == "buy":
@@ -695,6 +742,10 @@ class LondonBreakoutBot:
         if self.day_start_balance is None:
             return False
 
+        # Already tripped today — skip all checks silently
+        if self.circuit_breaker_hit:
+            return True
+
         account = mt5.account_info()
         if account is None:
             return False
@@ -703,6 +754,7 @@ class LondonBreakoutBot:
         daily_loss_pct = daily_loss / self.day_start_balance
 
         if daily_loss_pct >= self.p["max_daily_loss_pct"]:
+            self.circuit_breaker_hit = True
             log.warning(
                 f"CIRCUIT BREAKER: daily loss {daily_loss_pct*100:.1f}% "
                 f"(${daily_loss:,.0f}) — closing all positions, no more trades today"
@@ -712,9 +764,13 @@ class LondonBreakoutBot:
                 f"Daily loss: {daily_loss_pct*100:.1f}% (${daily_loss:,.0f})\n"
                 f"Closing all positions. No more trades today."
             )
+            # Close all LB positions
             for pair in self.pairs:
                 self._close_position(pair)
-                self.traded_today[pair] = True  # prevent new trades
+                self.traded_today[pair] = True
+            # Close all ER positions
+            for pair in self.er["pairs"]:
+                self._close_position(pair, magic=self.er["magic"])
             return True
 
         return False
@@ -725,11 +781,15 @@ class LondonBreakoutBot:
         self._update_day_start_balance()
         self.daily_trades = []
         self.daily_summary_sent = False
+        self.circuit_breaker_hit = False
         for pair in self.pairs:
             self.asian_high[pair] = 0.0
             self.asian_low[pair] = float("inf")
             self.traded_today[pair] = False
             self.current_date[pair] = today
+        # Reset ER daily counters
+        for pair in self.er["pairs"]:
+            self.er_daily_trade_count[pair] = 0
         log.info(f"New day: {today} | Start balance: ${self.day_start_balance:,.2f}")
 
     def _update_day_start_balance(self):
