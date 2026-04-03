@@ -146,6 +146,7 @@ class LondonBreakoutBot:
         self.day_start_balance = None
         self.day_start_date = None
         self.circuit_breaker_hit = False
+        self.session_closed = False
 
         # Daily trade log for summary
         self.daily_trades = []
@@ -281,17 +282,23 @@ class LondonBreakoutBot:
 
             # Phase 3: Session close
             elif hour >= self.p["session_close_utc"]:
-                self._close_position(pair)
+                if not self.session_closed:
+                    self._close_position(pair)
 
         # ── Extreme Reversion: runs independently on different pairs ────
         if self.er["session_start_utc"] <= hour < self.er["session_end_utc"]:
             if weekday in self.p["day_filter"]:
                 for pair in self.er["pairs"]:
                     self._check_extreme_reversion(pair)
-        elif hour >= self.p["session_close_utc"]:
+        elif hour >= self.p["session_close_utc"] and not self.session_closed:
             # Close any ER positions at session end
             for pair in self.er["pairs"]:
                 self._close_position(pair, magic=self.er["magic"])
+
+        # Mark session as closed after first attempt (don't retry every 15s)
+        if hour >= self.p["session_close_utc"] and not self.session_closed:
+            self.session_closed = True
+            log.info("Session closed. No more trading until next day.")
 
         # Send daily summary once after session close
         if hour >= self.p["session_close_utc"]:
@@ -733,9 +740,33 @@ class LondonBreakoutBot:
 
             result = mt5.order_send(request)
             if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                log.info(f"Position closed: ticket={pos.ticket}")
-            else:
-                log.error(f"Close failed: {result.retcode if result else mt5.last_error()}")
+                log.info(f"Position closed: ticket={pos.ticket} P/L=${pos.profit:+.2f}")
+                # Send close alert immediately (don't wait for _check_closed_positions)
+                if pos.ticket in self.tracked_positions:
+                    info = self.tracked_positions.pop(pos.ticket)
+                    pip_size = PIP_SIZES.get(pair, 0.0001)
+                    tag = info.get("tag", "LB")
+                    if info["direction"] == "buy":
+                        pips = (close_price - info["entry"]) / pip_size
+                    else:
+                        pips = (info["entry"] - close_price) / pip_size
+                    duration = (datetime.now(timezone.utc) - info["open_time"]).total_seconds() / 3600
+                    result_label = "WIN" if pos.profit > 0 else "LOSS" if pos.profit < 0 else "BE"
+                    send_telegram(
+                        f"<b>[{tag}] CLOSED — {result_label}</b>\n"
+                        f"{info['direction'].upper()} {pair} | {info['lots']} lots\n"
+                        f"Reason: Session Close\n"
+                        f"Entry: {info['entry']} → Exit: {close_price}\n"
+                        f"P/L: <code>${pos.profit:+,.2f}</code> ({pips:+.0f} pips)\n"
+                        f"Duration: {duration:.1f}h"
+                    )
+            elif result:
+                retcode = result.retcode
+                # 10018 = market closed, 10031 = no connection — don't spam
+                if retcode in (10018, 10031):
+                    log.warning(f"Cannot close {pair} ticket={pos.ticket}: market closed (code {retcode})")
+                else:
+                    log.error(f"Close failed: retcode={retcode} comment={result.comment}")
 
     def _daily_loss_exceeded(self):
         """Check if daily loss exceeds circuit breaker."""
@@ -782,6 +813,7 @@ class LondonBreakoutBot:
         self.daily_trades = []
         self.daily_summary_sent = False
         self.circuit_breaker_hit = False
+        self.session_closed = False
         for pair in self.pairs:
             self.asian_high[pair] = 0.0
             self.asian_low[pair] = float("inf")
