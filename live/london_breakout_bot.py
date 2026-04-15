@@ -280,22 +280,30 @@ class LondonBreakoutBot:
                 if not self.traded_today[pair] and not self._has_position(pair):
                     self._check_breakout(pair)
 
-            # Phase 3: Session close
+            # Phase 3: Session close — one attempt, then stop
             elif hour >= self.p["session_close_utc"]:
-                if not self.session_closed:
+                if not self.session_closed and self._has_position(pair):
                     self._close_position(pair)
 
-        # ── Extreme Reversion: runs independently on different pairs ────
-        if self.er["session_start_utc"] <= hour < self.er["session_end_utc"]:
-            if weekday in self.p["day_filter"]:
-                for pair in self.er["pairs"]:
-                    self._check_extreme_reversion(pair)
-        elif hour >= self.p["session_close_utc"] and not self.session_closed:
-            # Close any ER positions at session end
+        # ── Extreme Reversion: disabled — AUDNZD/EURCHF trending, not ranging ──
+        # ER was causing consistent losses ($3-6K/day) on trending AUDNZD.
+        # LB alone is on track for FTMO target. Re-enable after challenge is passed.
+        #
+        # if self.er["session_start_utc"] <= hour < self.er["session_end_utc"]:
+        #     if weekday in self.p["day_filter"]:
+        #         for pair in self.er["pairs"]:
+        #             self._check_extreme_reversion(pair)
+        # elif hour >= self.p["session_close_utc"]:
+        #     for pair in self.er["pairs"]:
+        #         if self._has_er_position(pair):
+        #             self._close_position(pair, magic=self.er["magic"])
+
+        # Close any lingering ER positions from before this session
+        if hour >= self.p["session_close_utc"]:
             for pair in self.er["pairs"]:
                 self._close_position(pair, magic=self.er["magic"])
 
-        # Mark session as closed after first attempt (don't retry every 15s)
+        # Mark session closed for logging purposes (no longer gates close logic)
         if hour >= self.p["session_close_utc"] and not self.session_closed:
             self.session_closed = True
             log.info("Session closed. No more trading until next day.")
@@ -617,52 +625,31 @@ class LondonBreakoutBot:
             info = self.tracked_positions.pop(ticket)
             pip_size = PIP_SIZES.get(info["pair"], 0.0001)
 
-            # Look up the closed deal in history for exact P/L
-            # Search from when the trade opened (not just today) to now
+            # Look up the closed deal by position ID — most reliable method,
+            # no timezone issues since we search by ID not timestamp
             now = datetime.now(timezone.utc)
-            search_start = info["open_time"] - timedelta(minutes=5)
-            deals = mt5.history_deals_get(search_start, now + timedelta(minutes=1))
-
             profit = 0.0
             close_price = 0.0
             close_reason = "Unknown"
 
+            deals = mt5.history_deals_get(position=ticket)
             if deals:
                 for d in deals:
-                    # Match by position_id OR by symbol+magic+close entry
-                    is_match = (
-                        d.position_id == ticket or
-                        (d.symbol == info["pair"] and d.entry == mt5.DEAL_ENTRY_OUT
-                         and abs(d.volume - info["lots"]) < 0.1)
-                    )
-                    if is_match and d.entry == mt5.DEAL_ENTRY_OUT:
+                    if d.entry == mt5.DEAL_ENTRY_OUT:
                         profit = d.profit + d.commission + d.swap
                         close_price = d.price
-                        if d.reason == 3:  # DEAL_REASON_SL
+                        if d.reason == 3:    # DEAL_REASON_SL
                             close_reason = "Stop Loss"
                         elif d.reason == 4:  # DEAL_REASON_TP
                             close_reason = "Take Profit"
                         elif d.reason == 0:  # DEAL_REASON_CLIENT
-                            close_reason = "Manual/Bot Close"
+                            close_reason = "Bot/Manual Close"
                         else:
-                            close_reason = f"Reason {d.reason}"
+                            close_reason = f"Code {d.reason}"
                         break
 
-            # Fallback: if deal lookup failed, try position history
+            # Fallback: current market price estimate
             if close_price == 0.0:
-                hist_orders = mt5.history_orders_get(search_start, now + timedelta(minutes=1))
-                if hist_orders:
-                    for o in hist_orders:
-                        if o.position_id == ticket:
-                            close_price = o.price_current if o.price_current > 0 else o.price_open
-                            if o.type == mt5.ORDER_TYPE_BUY or o.type == mt5.ORDER_TYPE_SELL:
-                                if o.comment and "sl" in o.comment.lower():
-                                    close_reason = "Stop Loss"
-                                elif o.comment and "tp" in o.comment.lower():
-                                    close_reason = "Take Profit"
-
-            # Last resort: estimate P/L from entry + current price
-            if profit == 0.0 and close_price == 0.0:
                 tick = mt5.symbol_info_tick(info["pair"])
                 if tick:
                     close_price = tick.bid if info["direction"] == "buy" else tick.ask
