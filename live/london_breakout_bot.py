@@ -39,7 +39,7 @@ PARAMS = {
     "magic": 100001,
 }
 
-DEFAULT_PAIRS = ["EURUSD", "GBPUSD", "GBPJPY", "EURJPY"]
+DEFAULT_PAIRS = ["EURUSD", "GBPUSD", "GBPJPY", "EURJPY", "USDCAD", "AUDUSD", "NZDUSD", "EURGBP"]
 
 # ── Extreme Reversion Parameters ─────────────────────────────────────
 ER_PARAMS = {
@@ -93,6 +93,8 @@ PIP_SIZES = {
     "GBPJPY": 0.01,
     "EURJPY": 0.01,
     "USDCAD": 0.0001,
+    "AUDUSD": 0.0001,
+    "NZDUSD": 0.0001,
     "EURCHF": 0.0001,
     "AUDNZD": 0.0001,
     "EURGBP": 0.0001,
@@ -444,7 +446,14 @@ class LondonBreakoutBot:
                 self.er_daily_trade_count[pair] = self.er_daily_trade_count.get(pair, 0) + 1
 
     def _check_breakout(self, pair):
-        """Check for breakout above/below Asian range."""
+        """Check for LONG breakout above Asian range, with 200 EMA trend filter.
+
+        Edge analysis on 520 historical trades found:
+          - Longs: 54.7% WR, +0.20R/trade
+          - Shorts: 44.6% WR, +0.07R/trade (essentially breakeven)
+          - Long + above 200EMA: 56.2% WR, +0.21R/trade
+        Shorts are disabled. Longs require price above 200 EMA on 15m.
+        """
         asian_high = self.asian_high[pair]
         asian_low = self.asian_low[pair]
 
@@ -461,39 +470,40 @@ class LondonBreakoutBot:
         if tick is None:
             return
 
-        # Breakout LONG
-        if tick.ask > asian_high:
-            sl = asian_low
+        # Only LONG breakouts — shorts have no edge in 2 years of data
+        if tick.ask <= asian_high:
+            return
+
+        # 200 EMA trend filter — skip if price is below 200 EMA
+        ema200 = self._calc_ema200(pair)
+        if ema200 is None or tick.ask < ema200:
+            return
+
+        sl = asian_low
+        sl_distance = tick.ask - sl
+        sl_pips = sl_distance / pip_size
+
+        if sl_pips > self.p["max_sl_pips"]:
+            sl = tick.ask - self.p["max_sl_pips"] * pip_size
             sl_distance = tick.ask - sl
-            sl_pips = sl_distance / pip_size
 
-            if sl_pips > self.p["max_sl_pips"]:
-                sl = tick.ask - self.p["max_sl_pips"] * pip_size
-                sl_distance = tick.ask - sl
+        tp = tick.ask + sl_distance * self.p["risk_reward"]
+        lots = self._calc_lot_size(pair, sl_distance)
 
-            tp = tick.ask + sl_distance * self.p["risk_reward"]
-            lots = self._calc_lot_size(pair, sl_distance)
+        if lots > 0:
+            self._place_trade(pair, "buy", tick.ask, sl, tp, lots)
+            self.traded_today[pair] = True
 
-            if lots > 0:
-                self._place_trade(pair, "buy", tick.ask, sl, tp, lots)
-                self.traded_today[pair] = True
-
-        # Breakout SHORT
-        elif tick.bid < asian_low:
-            sl = asian_high
-            sl_distance = sl - tick.bid
-
-            sl_pips = sl_distance / pip_size
-            if sl_pips > self.p["max_sl_pips"]:
-                sl = tick.bid + self.p["max_sl_pips"] * pip_size
-                sl_distance = sl - tick.bid
-
-            tp = tick.bid - sl_distance * self.p["risk_reward"]
-            lots = self._calc_lot_size(pair, sl_distance)
-
-            if lots > 0:
-                self._place_trade(pair, "sell", tick.bid, sl, tp, lots)
-                self.traded_today[pair] = True
+    def _calc_ema200(self, pair):
+        """Compute 200-period EMA on 15m bars."""
+        rates = mt5.copy_rates_from_pos(pair, mt5.TIMEFRAME_M15, 0, 250)
+        if rates is None or len(rates) < 200:
+            return None
+        k = 2 / 201
+        e = float(rates[0]["close"])
+        for r in rates[1:]:
+            e = float(r["close"]) * k + e * (1 - k)
+        return e
 
     def _calc_lot_size(self, pair, sl_distance, risk_pct=None):
         """Calculate lot size based on risk percentage."""
@@ -638,11 +648,13 @@ class LondonBreakoutBot:
                     if d.entry == mt5.DEAL_ENTRY_OUT:
                         profit = d.profit + d.commission + d.swap
                         close_price = d.price
-                        if d.reason == 3:    # DEAL_REASON_SL
+                        if d.reason == 4:    # DEAL_REASON_SL
                             close_reason = "Stop Loss"
-                        elif d.reason == 4:  # DEAL_REASON_TP
+                        elif d.reason == 5:  # DEAL_REASON_TP
                             close_reason = "Take Profit"
-                        elif d.reason == 0:  # DEAL_REASON_CLIENT
+                        elif d.reason == 6:  # DEAL_REASON_SO (stop out)
+                            close_reason = "Stop Out"
+                        elif d.reason in (0, 1, 2, 3):
                             close_reason = "Bot/Manual Close"
                         else:
                             close_reason = f"Code {d.reason}"
